@@ -186,9 +186,6 @@ function intersections(le::LineEdge,hl::HatchLine)
     #we now have t and lambda such that (p1 + v1*t) == pointalong(hl,t+lambda)
     #this intersection point lies between our endpoints if 0 <= t <= 1
     #we will use approxeqle (defined above) to handle numerical precision issues
-    @show t
-    @show (approxeqle(0,t) && approxeqle(t,1))
-    @show t+lambda
     return (approxeqle(0,t) && approxeqle(t,1)) ? [t+lambda] : nothing
 end
 
@@ -305,7 +302,7 @@ function intersections(ae::ArcEdge,hl::HatchLine)
         #angle of the intersection
         iangle = atan(reverse(rrci)...)
         #atan gives answers in the range [-pi,pi], we want a range of [0,2pi]
-        @show iangle = (iangle >= 0) ? iangle : iangle + 2pi
+        iangle = (iangle >= 0) ? iangle : iangle + 2pi
         #if rotangleinterval[2] > rotangleinterval[1] then iangle must lie between them to be on the arc
         if rotangleinterval[2] > rotangleinterval[1]
             return rotangleinterval[1] <= iangle <= rotangleinterval[2]
@@ -501,8 +498,6 @@ struct HatchedSlice
             end
             #we're having an issue when we're tangent to arcs, I think we can just remove
             #tangent points from intersection(arcedge,hl)
-            @show inters
-            @show [pointalong(hl,i) for i in inters]
             @assert iseven(length(inters))
             #we will sort these into an order based on `rev`
             sort!(inters;rev)
