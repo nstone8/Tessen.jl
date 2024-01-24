@@ -3,6 +3,7 @@ module Tessen
 using LinearAlgebra, Unitful, RecipesBase
 
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
+export Block, SuperBlock, blocks, hatch
 
 #absolute tolerance for isapprox
 atol = 1E-12
@@ -144,7 +145,7 @@ end
 function translate(le::LineEdge,displacement::Vector{<:Unitful.Length})
     #need to add units to the current points (all stored in microns)
     oldpoints = [le.p1, le.p2] .* u"μm"
-    LineEdge((oldpoints .+ displacement)...)
+    LineEdge((op + displacement for op in oldpoints)...)
 end
 
 """
@@ -352,23 +353,34 @@ Get the children of a `CompoundObject`
 """
 function children end
 
+#rotating and translating compound objects is just rotating/translating all the children
+function rotate(c::CO,args...) where {CO <: CompoundObject}
+    CO([rotate(ch,args...) for ch in children(c)])
+end
+
+function translate(c::CO,args...) where {CO <: CompoundObject}
+    CO([translate(ch,args...) for ch in children(c)])
+end
+
 #Contours are a list of edges
 struct Contour <: CompoundObject
     edges :: Vector{<:Edge}
 end
 
-#rotating and translating contours is just rotating/translating all the edges
-rotate(c::Contour,args...) = Contour([rotate(e,args...) for e in c.edges])
-translate(c::Contour,args...) = Contour([translate(e,args...) for e in c.edges])
 children(c::Contour) = c.edges
 
 #slices consist of a list of contours
+"""
+```julia
+Slice(contours)
+```
+A `Slice` represents a set of coplanar contours
+"""
 struct Slice <: CompoundObject
     contours :: Vector{Contour}
 end
 
 children(s::Slice) = s.contours
-
 function intersections(x::Union{Contour,Slice},hl::HatchLine)
     childintersections = [intersections(cx,hl) for cx in children(x)]
     #get rid of nothing entries and vcat into a flat Vector
@@ -404,7 +416,7 @@ end
 ```julia
 HatchedSlice(slice,dhatch,hatchdir)
 ```
-Create a `HatchedSlice` object representing `sliced` hatched with a hatching distance `dhatch`.
+Create a `HatchedSlice` object representing `slice` hatched with a hatching distance `dhatch`.
 `hatchdir` is the direction in which hatch lines will be laid down, the lines themselves will
 be perpendicular to this direction (which should be provided in radians). The `hatchlines`
 field of this struct is a vector of point pairs describing line segments presented in order to
@@ -531,14 +543,153 @@ end
     (mat[1,:],mat[2,:])
 end
 
-#blocks are a list of slices with corresponding z coordinates
+"""
+abstract type for Block and SuperBlock
+we will assume there are methods for origin and rotation
+as well as an inner constructor T(t::T,translation,rotation)
+"""
+abstract type LocalFrame{T} end
 
-#jobs are a list of blocks with corresponding [x,y,z] offsets
-
-#=====Hatching function should probably operate on Blocks======================
-function hatch(s::Slice,hatchdistance::Number,hatchdirection::Vector{<:Number})
-    #fill me out
+function translate(lf::LF,displacement::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
+    LF(lf,displacement,0)
 end
-==============================================================================#
 
+function rotate(lf::LF,amount,point::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
+    #point = ustrip.(u"µm",pointunits)
+    #get the translation associated with this rotation
+    o = origin(lf)[1:2] #xy coordinates
+    #translate o such that point lies at the origin
+    transo = o - point
+    #rotate about o and translate back
+    newo = zrotate(transo,amount) + point
+    translation = newo - o
+    #do the translation and rotation about the local origin
+    LF(lf,translation,amount)
+end
+
+
+"""
+```julia
+Block(z1 => slice1, z2 => slice2...; origin, rotation)
+```
+Assemble a series of `Slices` into a `Block`. `Slice` objects should be
+provided as a series of `z => slice` `Pair`s where `z` is the elevation of
+the slice with units of `Unitful.Length`. The optional `origin` and `rotation`
+keywords define a local reference frame in which all the component `Slice`
+geometry is interpreted.
+"""
+struct Block{T} <: LocalFrame{T}
+    #origin position (in 3d) in microns
+    origin::Vector{<:Number}
+    #local frame rotation in radians
+    rotation::Number
+    #a dict where the keys are slice elevation and the values are a
+    #vector of all the slices to be written at that elevation
+    slices::Dict{<:Number,Vector{T}}
+    function Block(origin::Vector{<:Unitful.Length},rotation::Number,
+                   slicepairs::Pair...)
+        #strip units, we will represent everything internally in microns
+        rawslice = [ustrip(u"µm",sp.first) => sp.second for sp in slicepairs]
+        #change our slice pairs into a dict
+        allz = [rs.first for rs in rawslice]
+        slicetype = eltype([rs.second for rs in rawslice])
+        @assert slicetype <: Union{Slice,HatchedSlice} "Blocks are built from slices"
+        #initialize all required slice vectors in the dict
+        slices = Dict(z => Vector{slicetype}() for z in allz)
+        #now push all the slices onto the correct vector
+        for (z,s) in rawslice
+            push!(slices[z],s)
+        end
+        new{slicetype}(ustrip.(u"µm",origin),rotation,slices)
+    end
+    #LocalFrame innner constructor to make translation/rotation easier
+    function Block{T}(b::Block{T},translation,rotation) where {T}
+        #if translation isn't in 3D, go ahead and assume we mean movement in xy
+        if length(translation) == 2
+            push!(translation,0u"µm")
+        end
+        new{T}(ustrip.(u"µm",(b.origin * 1u"µm") + translation),
+               b.rotation + rotation, b.slices)
+    end
+end
+
+#make kwargs optional
+Block(slices...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) = Block(origin,rotation,slices...)
+#required localframe methods
+origin(b::Block) = b.origin * 1u"µm"
+rotation(b::Block) = b.rotation
+
+"""
+```julia
+SuperBlock(blocks...;origin,rotation)
+```
+Combine `Block`s and `SuperBlock`s into a single entity. The optional `origin` and
+`rotation` keyword arguments define a local coordinate system in which the enclosed
+geometry is interpreted. The `blocks` argument is treated such that order matters,
+earlier arguments will be printed first.
+"""
+struct SuperBlock{T} <: LocalFrame{T}
+    #origin position (in 3d) in microns
+    origin::Vector{<:Number}
+    #local frame rotation in radians
+    rotation::Number
+    blocks::Vector{LocalFrame{T}}
+
+    function SuperBlock(origin::Vector{<:Unitful.Length},rotation::Number,
+                        blocks::LocalFrame{T}...) where {T}
+        new{T}(ustrip.(u"µm",origin),rotation,collect(blocks))
+    end
+
+    #localframe constructor
+    function SuperBlock{T}(sb::SuperBlock{T},translation,rotation) where {T}
+        #if translation isn't in 3D, go ahead and assume we mean movement in xy
+        if length(translation) == 2
+            push!(translation,0)
+        end
+        new{T}(ustrip.(u"µm",(sb.origin * 1u"µm") + translation),
+               sb.rotation + rotation, sb.blocks)
+    end
+end
+SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm"],rotation=0) = SuperBlock(origin,rotation,blocks...)
+origin(sb::SuperBlock) = sb.origin * 1u"µm"
+rotation(sb::SuperBlock) = sb.rotation
+
+#plot recipes for blocks and superblocks
+@recipe function plotblock(b::Block)
+    legend --> false
+    aspect_ratio --> 1
+    for z in keys(b.slices)
+        for rawslice in b.slices[z]
+            #do coordinate transformation in xy here
+            slice = translate(rotate(rawslice,rotation(b)),origin(b)[1:2])
+            for contour in children(slice)
+                for edge in children(contour)
+                    points = boundpoints(edge)
+                    pointsmat = vcat(permutedims.(points)...)
+                    @series begin
+                        seriestype --> :path3d
+                        #add on our z coordinate, add coordinate transformation
+                        transz = z + ustrip(u"µm",origin(b)[3])
+                        (pointsmat[:,1],pointsmat[:,2],repeat([transz],size(pointsmat)[1]))
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+@recipe function plotsuperblock(sb::SuperBlock)
+    legend --> false
+    aspect_ratio --> 1
+    for b in sb.blocks
+        #do coordinate tranformation
+        transblock = translate(rotate(b,rotation(sb)),origin(sb))
+        @series begin
+            transblock
+        end
+    end
+    return nothing
+end
+                         
 end # module Tessen
