@@ -1,9 +1,9 @@
 module Tessen
 
-using LinearAlgebra, Unitful, RecipesBase
+using LinearAlgebra, Unitful, RecipesBase, Statistics
 
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
-export Block, SuperBlock, blocks, hatch
+export Block, SuperBlock, blocks, slices, hatch
 
 #absolute tolerance for isapprox
 atol = 1E-12
@@ -248,7 +248,7 @@ function translate(ae::ArcEdge,displacement::Vector{<:Unitful.Length})
     #all we have to do is translate our center point
     oldc = ae.c * u"μm" #need to add back on units
     newc = oldc + displacement
-    ArcEdge(newc,ae.r,ae.startangle,ae.stopangle)
+    ArcEdge(newc,ae.r*1u"µm",ae.startangle,ae.stopangle)
 end
 
 function intersections(ae::ArcEdge,hl::HatchLine)
@@ -342,32 +342,13 @@ end
     (pointsmat[:,1],pointsmat[:,2])
 end
 
-#make an abstract supertype for objects which are just lists of child objects
-abstract type CompoundObject end
-
-"""
-```julia
-children(obj)
-```
-Get the children of a `CompoundObject`
-"""
-function children end
-
-#rotating and translating compound objects is just rotating/translating all the children
-function rotate(c::CO,args...) where {CO <: CompoundObject}
-    CO([rotate(ch,args...) for ch in children(c)])
-end
-
-function translate(c::CO,args...) where {CO <: CompoundObject}
-    CO([translate(ch,args...) for ch in children(c)])
-end
-
 #Contours are a list of edges
-struct Contour <: CompoundObject
+struct Contour
     edges :: Vector{<:Edge}
 end
 
-children(c::Contour) = c.edges
+#abstract supertype for Slices
+abstract type AbstractSlice end
 
 #slices consist of a list of contours
 """
@@ -376,9 +357,30 @@ Slice(contours)
 ```
 A `Slice` represents a set of coplanar contours
 """
-struct Slice <: CompoundObject
+struct Slice <: AbstractSlice
     contours :: Vector{Contour}
 end
+
+
+"""
+```julia
+children(obj)
+```
+Get the children of a `Contour` or `Slice`
+"""
+function children end
+
+children(c::Contour) = c.edges
+
+#rotating and translating compound objects is just rotating/translating all the children
+function rotate(c::CO,args...) where CO <: Union{Contour,Slice}
+    CO([rotate(ch,args...) for ch in children(c)])
+end
+
+function translate(c::CO,args...) where CO <: Union{Contour,Slice}
+    CO([translate(ch,args...) for ch in children(c)])
+end
+
 
 children(s::Slice) = s.contours
 function intersections(x::Union{Contour,Slice},hl::HatchLine)
@@ -387,10 +389,24 @@ function intersections(x::Union{Contour,Slice},hl::HatchLine)
     inters = vcat(filter(childintersections) do ci
                       !isnothing(ci)
                   end...)
-    isempty(inters) ? nothing : inters
+    if isempty(inters)
+        return nothing
+    end
+    #try to get only unique values (we can intersect multiple entities at points
+    #like vertices
+    uniqueinters = Vector{eltype(inters)}()
+    for thisinter in inters
+        if isempty(uniqueinters)
+            push!(uniqueinters,thisinter)
+        elseif !any(isapprox.(thisinter,uniqueinters;atol))
+            #we don't yet have something like thisinter
+            push!(uniqueinters,thisinter)
+        end
+    end
+    return uniqueinters
 end
 
-function boundbox(co::CompoundObject)
+function boundbox(co::Union{Contour,Slice})
     childboxes = boundbox.(children(co))
     map(zip([minimum,maximum],[1,2])) do (m,corner)
         map([1,2]) do dim
@@ -399,7 +415,7 @@ function boundbox(co::CompoundObject)
     end
 end
 
-@recipe function plotco(co::CompoundObject)
+@recipe function plotco(co::Union{Contour,Slice})
     legend --> false
     aspect_ratio --> 1
     for c in children(co)
@@ -414,77 +430,72 @@ end
 #order
 """
 ```julia
-HatchedSlice(slice,dhatch,hatchdir)
+HatchedSlice(hatchlines)
 ```
-Create a `HatchedSlice` object representing `slice` hatched with a hatching distance `dhatch`.
-`hatchdir` is the direction in which hatch lines will be laid down, the lines themselves will
-be perpendicular to this direction (which should be provided in radians). The `hatchlines`
-field of this struct is a vector of point pairs describing line segments presented in order to
-neatly hatch the provided `slice` in a zigzag pattern.
+`struct` representing a hatched `Slice`. The `hatchlines` field of this struct
+is a vector of point pairs describing line segments presented in order to
+neatly hatch the `Slice` in a zigzag pattern. This constructor is not intended to be
+used directly. Use the `hatch` function instead.
 """
-struct HatchedSlice
+struct HatchedSlice <: AbstractSlice
     hatchlines :: Vector{Vector{Vector{<:Number}}}
-    function HatchedSlice(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)
-        #=============================Hatching strategy=========================
-        1) get the bounding box of our slice
-        2) trace this box with a contour
-        3) place the first hatchline on the corner of the bounding box where intersections between
-           this line and the bounding box are closest together (if these intersections are far
-           apart we're missing part of the shape
-        4) continue placing hatchlines until we place a hatchline that doesn't intersect our box
-        5) done
-        ======================================================================#
-        bboxcorners = boundbox(s) .* 1u"µm" #need units for the LineEdge constructor
-        bboxedges = [LineEdge(bboxcorners[1],
-                              [bboxcorners[2][1],bboxcorners[1][2]]),
-                     LineEdge([bboxcorners[2][1],bboxcorners[1][2]],
-                              bboxcorners[2]),
-                     LineEdge(bboxcorners[2],
-                              [bboxcorners[1][1],bboxcorners[2][2]]),
-                     LineEdge([bboxcorners[1][1],bboxcorners[2][2]],
-                              bboxcorners[1])]
-        #hatchlines will be written such that they are perpendicular to hatchdir
-        vhatch = dhatchunits*[cos(hatchdir+pi/2),sin(hatchdir+pi/2)]
-        #try placing initial hatch lines at every corner and pick the corner where the 2
-        #intersections with our bounding box are closest together
-        (_,startpointindex) = findmin(bboxcorners) do bc
-            hl = HatchLine(bc,vhatch)
-            inters = [intersections(be,hl) for be in bboxedges]
-            #remove nothing entries corresponding to edges with no intersection
-            filter!(inters) do i
-                !isnothing(i)
-            end
-            inters=vcat(inters...)
-            #we can end up with more than two intersections since we are directly on a corner
-            #but this will never be a good starting point
-            if length(inters) > 2
-                return Inf
-            end
-            #could also freak out if we're hatching parallel to an edge, but I think we can
-            #just commit to not doing that.
-            #intersections now containts two parametric coordinates for the two intersections
-            #along hl, we want to compare the distances
-            @assert length(inters) == 2
-            abs(-(inters...))
+end
+
+function rotate(hs::HatchedSlice,amount::Number,pointunits::Vector{<:Unitful.Length})
+    point = ustrip.(u"µm",pointunits)
+    map(hs.hatchlines) do line
+        map(line) do p
+            transp = p - point
+            zrotate(transp,amount) + point            
         end
-        startpoint = bboxcorners[startpointindex]
-        #get the distance between startpoints for neighboring hatchlines. these points will be
-        #dhatch apart along hatchdir
-        poffset = dhatchunits*[cos(hatchdir),sin(hatchdir)]
-        #it is possible this poffset is in the wrong direction (going away from the bounding box)
-        #check that there are intersections for the second hatchline, if there are none, reverse
-        #direction
-        secondpoint = startpoint + poffset
-        secondpointints = [intersections(be,HatchLine(secondpoint,vhatch)) for be in bboxedges]
-        correctdir = any(secondpointints) do spi
-            !isnothing(spi)
+    end |> HatchedSlice
+end
+
+function translate(hs::HatchedSlice,displacement::Vector{<:Unitful.Length})
+    disp = ustrip.(u"µm",displacement)
+    map(hs.hatchlines) do line
+        map(line) do p
+            p + disp
         end
-        if !correctdir
-            poffset *= -1
-        end
-        #lay down our hatchlines
+    end |> HatchedSlice
+end
+
+function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSlice
+    #=============================Hatching strategy=========================
+    1) get the bounding box of our slice
+    2) trace this box with a contour
+    3) place the first hatchline on the center of our bounding box
+    4) place hatchlines in each direction until we place a hatchline that doesn't intersect our box
+    5) done
+    ======================================================================#
+    bboxcorners = boundbox(s) .* 1u"µm" #need units for the LineEdge constructor
+    bboxedges = [LineEdge(bboxcorners[1],
+                          [bboxcorners[2][1],bboxcorners[1][2]]),
+                 LineEdge([bboxcorners[2][1],bboxcorners[1][2]],
+                          bboxcorners[2]),
+                 LineEdge(bboxcorners[2],
+                          [bboxcorners[1][1],bboxcorners[2][2]]),
+                 LineEdge([bboxcorners[1][1],bboxcorners[2][2]],
+                          bboxcorners[1])]
+    #hatchlines will be written such that they are perpendicular to hatchdir
+    vhatch = dhatchunits*[cos(hatchdir+pi/2),sin(hatchdir+pi/2)]
+
+    startpoint = mean(bboxcorners) #center of bounding box
+    #get the distance between startpoints for neighboring hatchlines. these points will be
+    #dhatch apart along hatchdir
+    poffset = dhatchunits*[cos(hatchdir),sin(hatchdir)]
+
+    #lay down our hatchlines. We will collect each direction from the center in different
+    #vectors so we can rearrange into a continuous order
+    hlinesvec = map([false,true]) do rev
         curpoint = startpoint
-        hlines = HatchLine[]
+        #if we've already gone 'forward' reverse direction and don't redo start point
+        if rev
+            poffset *= -1
+            curpoint += poffset
+        end
+        #lay down hatchlines in this direction
+        thesehlines = HatchLine[]
         while true
             hl = HatchLine(curpoint,vhatch)
             #if this doesn't intersect our bounding box, we're done
@@ -492,47 +503,67 @@ struct HatchedSlice
             if all(isnothing,inters)
                 break
             end
-            #otherwise pop it into hlines and move curpoint
-            push!(hlines,hl)
+            #otherwise pop it into thesehlines and move curpoint
+            push!(thesehlines,hl)
             curpoint += poffset
         end
-        #now build an array of point pairs alternating directions
-        #build a generator that gives alternating true false to do the zigzag
-        alternator = (isodd(i) for i in 1:length(hlines))
-        #this will be a vector of vectors ordered such that vcatting and reshaping
-        #can be used to get the point pairs we want
-        intervec = map(zip(hlines,alternator)) do (hl,rev)
-            #get the even number of points where `hl` intersects `s`
-            inters = intersections(s,hl)
-            #if there are no intersections, just add nothing
-            if isnothing(inters)
-                return nothing
-            end
-            #we're having an issue when we're tangent to arcs, I think we can just remove
-            #tangent points from intersection(arcedge,hl)
-            @assert iseven(length(inters))
-            #we will sort these into an order based on `rev`
-            sort!(inters;rev)
-            #now need to turn this into points rather than parametric coords
-            [pointalong(hl,i) for i in inters]
-        end
-        #remove nothing entries
-        filter!(intervec) do iv
-            !isnothing(iv)
-        end
-        #split the intersections into pairs via reshape        
-        intermat = reshape(vcat(intervec...),2,:)
-        #change the matrix into a vector of vectors of vectors
-        hatchlines = map(1:size(intermat)[2]) do i
-            intermat[:,i]
-        end
-        #now filter out any zero-length hatchlines
-        filter!(hatchlines) do (p1,p2)
-            !all(isapprox.(p1,p2;atol))
-        end
-        new(hatchlines)
+        #need to explicitly return thesehlines so they end up in hlinesvec
+        return thesehlines
     end
+    #make one list of hatch lines in the correct order
+    hlines = vcat(reverse(hlinesvec[2]),hlinesvec[1])
+    #now build an array of point pairs alternating directions
+    #build a generator that gives alternating true false to do the zigzag
+    alternator = (isodd(i) for i in 1:length(hlines))
+    #this will be a vector of vectors ordered such that vcatting and reshaping
+    #can be used to get the point pairs we want
+    intervec = map(zip(hlines,alternator)) do (hl,rev)
+        #get the even number of points where `hl` intersects `s`
+        inters = intersections(s,hl)
+        #if there are no intersections, just add nothing
+        if isnothing(inters)
+            return nothing
+        end
+        #if inters has only one entry we are perfectly clipping the corner of a polygon
+        #these cases (like tangent points on arcs) don't matter for hatching
+        if length(inters) == 1
+            return nothing
+        end
+        @assert iseven(length(inters))
+        #we will sort these into an order based on `rev`
+        sort!(inters;rev)
+        #now need to turn this into points rather than parametric coords
+        [pointalong(hl,i) for i in inters]
+    end
+    #remove nothing entries
+    filter!(intervec) do iv
+        !isnothing(iv)
+    end
+    #split the intersections into pairs via reshape        
+    intermat = reshape(vcat(intervec...),2,:)
+    #change the matrix into a vector of vectors of vectors
+    hatchlines = map(1:size(intermat)[2]) do i
+        intermat[:,i]
+    end
+    #now filter out any zero-length hatchlines
+    filter!(hatchlines) do (p1,p2)
+        !all(isapprox.(p1,p2;atol))
+    end
+    HatchedSlice(hatchlines)
 end
+
+#ignore slices which are already hatched
+hatch(hs::HatchedSlice,args...) = hs
+
+"""
+```julia
+hatch(slice; dhatch [,hatchdir])
+```
+Hatch an `AbstractSlice` object with the provided hatch distance (as `Unitful.Length`)
+and optional hatch direction (default is `0` radians). The hatch lines themselves will
+be perpendicular to `hatchdir`.
+"""
+hatch(s::AbstractSlice;dhatch,hatchdir=0) = hatch(s,dhatch,hatchdir)
 
 @recipe function ploths(hs::HatchedSlice)
     legend --> false
@@ -553,6 +584,59 @@ abstract type LocalFrame{T} end
 function translate(lf::LF,displacement::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
     LF(lf,displacement,0)
 end
+
+"""
+```julia
+translate(block, displacement[; preserveframe=false])
+```
+Translate a `Block` or `SuperBlock`. If preserveframe=true is passed, the local coordinate system
+of `block` is not modified (this is accomplished by recursively translating all contained `Slice`
+objects)
+"""
+function translate(lf::LocalFrame,displacement;preserveframe::Bool)
+    if !preserveframe
+        translate(lf,displacement)
+    else
+        pftranslate(lf,displacement)
+    end
+end
+
+"""
+```julia
+rotate(block, amount, [point; preserveframe=false])
+```
+Rotate a `Block` or `SuperBlock`. If preserveframe=true is passed, the local coordinate system
+of `block` is not modified (this is accomplished by recursively moving all contained `Slice`
+objects)
+"""
+function rotate(lf::LocalFrame,amount::Number,point::Vector{<:Unitful.Length};preserveframe::Bool)
+    if !preserveframe
+        rotate(lf,amount,point)
+    else
+        pfrotate(lf,amount,point)
+    end
+end
+
+#make it so point is optional
+rotate(lf::LocalFrame,amount;preserveframe) = rotate(lf,amount,[0u"µm",0u"µm"]; preserveframe)
+
+"""
+```julia
+pftranslate(lf,displacement)
+```
+Translate a `LocalFrame` without modifying any local coordinate systems. This function
+is called when `translate` is used on a `LocalFrame` with `preserveframe=true`
+"""
+function pftranslate end
+
+"""
+```julia
+pfrotate(lf,amount,point)
+```
+Rotate a `LocalFrame` without modifying any local coordinate systems. This function
+is called when `rotate` is used on a `LocalFrame` with `preserveframe=true`
+"""
+function pfrotate end
 
 function rotate(lf::LF,amount,point::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
     #point = ustrip.(u"µm",pointunits)
@@ -591,9 +675,9 @@ struct Block{T} <: LocalFrame{T}
         #strip units, we will represent everything internally in microns
         rawslice = [ustrip(u"µm",sp.first) => sp.second for sp in slicepairs]
         #change our slice pairs into a dict
-        allz = [rs.first for rs in rawslice]
+        allz = Set([rs.first for rs in rawslice])
         slicetype = eltype([rs.second for rs in rawslice])
-        @assert slicetype <: Union{Slice,HatchedSlice} "Blocks are built from slices"
+        @assert slicetype <: AbstractSlice "Blocks are built from slices"
         #initialize all required slice vectors in the dict
         slices = Dict(z => Vector{slicetype}() for z in allz)
         #now push all the slices onto the correct vector
@@ -618,6 +702,68 @@ Block(slices...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) = Block(origin,rota
 #required localframe methods
 origin(b::Block) = b.origin * 1u"µm"
 rotation(b::Block) = b.rotation
+
+"""
+```julia
+slices(block)
+```
+Get all the `Slice`s and `HatchedSlice`s which make up a `Block`
+"""
+slices(b::Block) = b.slices
+
+function pftranslate(b::Block,displacement::Vector{<:Unitful.Length})
+    #if displacement has length 2, assume translation in xy
+    if length(displacement) == 2
+        push!(displacement,0u"µm")
+    end
+    @assert length(displacement) == 3
+    #translate every slice individually in xy
+    #need to convert xy displacement into the local coordinate system
+    localdisp = zrotate(displacement[1:2],-rotation(b))
+    slicevecs = map(keys(slices(b)) |> collect) do z
+        theseslices = slices(b)[z]
+        transslices = [translate(ts,localdisp) for ts in theseslices]
+        #translate in z
+        (z*u"µm" + displacement[3]) => transslices
+    end
+    #slicevecs is a vector of z => [slice1, slice2, slice3] pairs.
+    #convert to [z=>slice1, z=>slice2, z=>slice3]
+    flatslices = [z=>slice for (z, sv) in slicevecs for slice in sv]
+    Block(flatslices...,origin=origin(b),rotation=rotation(b))
+end
+
+function pfrotate(b::Block,amount::Number,point::Vector{<:Unitful.Length})
+    #fill me out
+end
+
+function hatch(b::Block, dhatch::Unitful.Length, bottomdir::Number,diroffset::Number)::Block{HatchedSlice}
+    #get the elevation of every slice in order
+    oldslices = slices(b)
+    sortedz = keys(oldslices) |> collect |> sort
+    #get a vector of the same length giving the hatch direction of each slice
+    dirvec = range(start=bottomdir, step=diroffset, length=length(sortedz))
+    #build a vector of z => slice pairs
+    #===================================ugly
+    pairvec = vcat(([z*1u"µm" => hatch(thisslice;dhatch,hatchdir) for thisslice in oldslices[z]]
+    for (z,hatchdir) in zip(sortedz,dirvec))...)
+    =======================================#
+    pairvec = [z*1u"µm" => hatch(thisslice;dhatch,hatchdir) for (z,hatchdir) in zip(sortedz,dirvec)
+                   for thisslice in oldslices[z]]
+    Block(pairvec..., origin=origin(b), rotation=rotation(b))
+end
+
+"""
+```julia
+hatch(block; dhatch [,bottomdir, diroffset])
+```
+Hatch a `Block` with uniform hatching distance `dhatch`. Any `Slice`s in the block which are
+already hatched will not be modified. `dhatch` is the uniform slicing distance, the optional
+keyword arguments `bottomdir` and `diroffset` control the hatching direction of the bottommost
+slice and the direction offset between slices.
+"""
+function hatch(b::Block; dhatch, bottomdir=0, diroffset=pi/2)
+    hatch(b,dhatch,bottomdir,diroffset)
+end
 
 """
 ```julia
@@ -654,6 +800,50 @@ SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm"],rotation=0) = SuperBlo
 origin(sb::SuperBlock) = sb.origin * 1u"µm"
 rotation(sb::SuperBlock) = sb.rotation
 
+"""
+```julia
+blocks(sb)
+```
+Get all of the blocks which make up a `SuperBlock`
+"""
+blocks(sb::SuperBlock) = sb.blocks
+
+function pftranslate(sb::SuperBlock,displacement::Vector{<:Unitful.Length})
+    #if displacement has length 2, assume translation in xy
+    if length(displacement) == 2
+        push!(displacement,0u"µm")
+    end
+    #need to convert xy displacement into local coordinate system
+    xylocaldisp = zrotate(displacement[1:2],-rotation(sb))
+    localdisp = vcat(xylocaldisp,displacement[3])
+    translatedblocks = map(blocks(sb)) do b
+        pftranslate(b,localdisp)
+    end
+    SuperBlock(translatedblocks...,origin=origin(sb),rotation=rotation(sb))
+end
+
+function pfrotate(sb::SuperBlock,amount::Number,point::Vector{<:Unitful.Length})
+    #fill me out
+end
+
+function hatch(sb::SuperBlock, dhatch::Unitful.Length, bottomdir::Number, diroffset::Number)
+    SuperBlock(hatch.(blocks(sb);dhatch,bottomdir,diroffset)...,
+               origin=origin(sb),
+               rotation=rotation(sb))
+end
+
+"""
+```julia
+hatch(superblock; dhatch [,bottomdir, diroffset])
+```
+Hatch all `Block`s contained in a `SuperBlock` with uniform hatching distance `dhatch`.
+Any `Slice`s in the block which are already hatched will not be modified. `dhatch` is
+the uniform slicing distance, the optional keyword arguments `bottomdir` and `diroffset`
+control the hatching direction of the bottommost slice and the direction offset between slices.
+"""
+function hatch(sb::SuperBlock; dhatch, bottomdir=0, diroffset=pi/2)
+    hatch(sb,dhatch,bottomdir,diroffset)
+end
 #plot recipes for blocks and superblocks
 @recipe function plotblock(b::Block)
     legend --> false
@@ -662,16 +852,27 @@ rotation(sb::SuperBlock) = sb.rotation
         for rawslice in b.slices[z]
             #do coordinate transformation in xy here
             slice = translate(rotate(rawslice,rotation(b)),origin(b)[1:2])
-            for contour in children(slice)
-                for edge in children(contour)
-                    points = boundpoints(edge)
-                    pointsmat = vcat(permutedims.(points)...)
-                    @series begin
-                        seriestype --> :path3d
-                        #add on our z coordinate, add coordinate transformation
-                        transz = z + ustrip(u"µm",origin(b)[3])
-                        (pointsmat[:,1],pointsmat[:,2],repeat([transz],size(pointsmat)[1]))
+            #add on our z coordinate, add coordinate transformation
+            transz = z + ustrip(u"µm",origin(b)[3])
+            if slice isa Slice
+                for contour in children(slice)
+                    for edge in children(contour)
+                        points = boundpoints(edge)
+                        pointsmat = vcat(permutedims.(points)...)
+                        @series begin
+                            seriestype --> :path3d
+                            (pointsmat[:,1],pointsmat[:,2],repeat([transz],size(pointsmat)[1]))
+                        end
                     end
+                end
+            else
+                @assert slice isa HatchedSlice
+                pointsmat = vcat(map(slice.hatchlines) do hl
+                                     vcat(permutedims.(hl)...,[missing missing])
+                                 end...)
+                @series begin
+                    seriestype --> :path3d
+                    (pointsmat[:,1],pointsmat[:,2],repeat([transz],size(pointsmat)[1]))
                 end
             end
         end
