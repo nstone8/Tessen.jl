@@ -581,10 +581,6 @@ as well as an inner constructor T(t::T,translation,rotation)
 """
 abstract type LocalFrame{T} end
 
-function translate(lf::LF,displacement::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
-    LF(lf,displacement,0)
-end
-
 """
 ```julia
 translate(block, displacement[; preserveframe=false])
@@ -593,9 +589,9 @@ Translate a `Block` or `SuperBlock`. If preserveframe=true is passed, the local 
 of `block` is not modified (this is accomplished by recursively translating all contained `Slice`
 objects)
 """
-function translate(lf::LocalFrame,displacement;preserveframe::Bool)
+function translate(lf::LocalFrame,displacement;preserveframe=false)
     if !preserveframe
-        translate(lf,displacement)
+        npftranslate(lf,displacement)
     else
         pftranslate(lf,displacement)
     end
@@ -609,16 +605,16 @@ Rotate a `Block` or `SuperBlock`. If preserveframe=true is passed, the local coo
 of `block` is not modified (this is accomplished by recursively moving all contained `Slice`
 objects)
 """
-function rotate(lf::LocalFrame,amount::Number,point::Vector{<:Unitful.Length};preserveframe::Bool)
+function rotate(lf::LocalFrame,amount::Number,point::Vector{<:Unitful.Length};preserveframe=false)
     if !preserveframe
-        rotate(lf,amount,point)
+        npfrotate(lf,amount,point)
     else
         pfrotate(lf,amount,point)
     end
 end
 
-#make it so point is optional
-rotate(lf::LocalFrame,amount;preserveframe) = rotate(lf,amount,[0u"µm",0u"µm"]; preserveframe)
+#make point optional
+rotate(lf::LocalFrame,amount;preserveframe=false) = rotate(lf,amount,[0u"µm",0u"µm"];preserveframe)
 
 """
 ```julia
@@ -638,7 +634,25 @@ is called when `rotate` is used on a `LocalFrame` with `preserveframe=true`
 """
 function pfrotate end
 
-function rotate(lf::LF,amount,point::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
+"""
+```julia
+npftranslate(lf,displacement)
+```
+Translate a `LocalFrame` by modifying the local coordinate system. This function
+is called when `translate` is used on a `LocalFrame` with `preserveframe=false`
+"""
+function npftranslate(lf::LF,displacement::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
+    LF(lf,displacement,0)
+end
+
+"""
+```julia
+npfrotate(lf,amount,point)
+```
+Rotate a `LocalFrame` by modifying the local coordinate system. This function
+is called when `rotate` is used on a `LocalFrame` with `preserveframe=false`.
+"""
+function npfrotate(lf::LF,amount,point::Vector{<:Unitful.Length}) where {LF <: LocalFrame}
     #point = ustrip.(u"µm",pointunits)
     #get the translation associated with this rotation
     o = origin(lf)[1:2] #xy coordinates
@@ -651,12 +665,11 @@ function rotate(lf::LF,amount,point::Vector{<:Unitful.Length}) where {LF <: Loca
     LF(lf,translation,amount)
 end
 
-
 """
 ```julia
 Block(z1 => slice1, z2 => slice2...; origin, rotation)
 ```
-Assemble a series of `Slices` into a `Block`. `Slice` objects should be
+Assemble a series of `Slice`s into a `Block`. `Slice` objects should be
 provided as a series of `z => slice` `Pair`s where `z` is the elevation of
 the slice with units of `Unitful.Length`. The optional `origin` and `rotation`
 keywords define a local reference frame in which all the component `Slice`
@@ -707,10 +720,11 @@ rotation(b::Block) = b.rotation
 ```julia
 slices(block)
 ```
-Get all the `Slice`s and `HatchedSlice`s which make up a `Block`
+Get all the `Slice`s and `HatchedSlice`s which make up a `Block`. Returned
+as a `Vector` of `z => slice` pairs (i.e. the format expected by the `Block`
+constructor).
 """
-slices(b::Block) = b.slices
-
+slices(b::Block) = [(z*u"µm") => slice for (z,slicevec) in b.slices for slice in slicevec]
 function pftranslate(b::Block,displacement::Vector{<:Unitful.Length})
     #if displacement has length 2, assume translation in xy
     if length(displacement) == 2
@@ -720,35 +734,33 @@ function pftranslate(b::Block,displacement::Vector{<:Unitful.Length})
     #translate every slice individually in xy
     #need to convert xy displacement into the local coordinate system
     localdisp = zrotate(displacement[1:2],-rotation(b))
-    slicevecs = map(keys(slices(b)) |> collect) do z
-        theseslices = slices(b)[z]
-        transslices = [translate(ts,localdisp) for ts in theseslices]
-        #translate in z
-        (z*u"µm" + displacement[3]) => transslices
-    end
-    #slicevecs is a vector of z => [slice1, slice2, slice3] pairs.
-    #convert to [z=>slice1, z=>slice2, z=>slice3]
-    flatslices = [z=>slice for (z, sv) in slicevecs for slice in sv]
+    flatslices = [(z + displacement[3]) => translate(ts,localdisp) for (z,ts) in slices(b)]
     Block(flatslices...,origin=origin(b),rotation=rotation(b))
 end
 
 function pfrotate(b::Block,amount::Number,point::Vector{<:Unitful.Length})
-    #fill me out
+    #figure out the coordinates of `point` in our local coordinate system
+    pvec = point - origin(b)[1:2] #vector pointing from the origin of b to point in our global frames xy plane
+    #minus sign on rotation because rotation(b) is the rotation required to convert from the
+    #local frame to the global frame, we're going in the opposite direction
+    plocal = zrotate(pvec,-rotation(b))
+    #now we can just do the rotations about plocal in the local frame
+    rotslices = [z => rotate(s,amount,plocal) for (z,s) in slices(b)]
+    Block(rotslices...,origin=origin(b),rotation=rotation(b))
 end
 
 function hatch(b::Block, dhatch::Unitful.Length, bottomdir::Number,diroffset::Number)::Block{HatchedSlice}
     #get the elevation of every slice in order
     oldslices = slices(b)
-    sortedz = keys(oldslices) |> collect |> sort
+    sortedz = Set(z for (z,_) in oldslices) |> collect |> sort
     #get a vector of the same length giving the hatch direction of each slice
     dirvec = range(start=bottomdir, step=diroffset, length=length(sortedz))
-    #build a vector of z => slice pairs
-    #===================================ugly
-    pairvec = vcat(([z*1u"µm" => hatch(thisslice;dhatch,hatchdir) for thisslice in oldslices[z]]
-    for (z,hatchdir) in zip(sortedz,dirvec))...)
-    =======================================#
-    pairvec = [z*1u"µm" => hatch(thisslice;dhatch,hatchdir) for (z,hatchdir) in zip(sortedz,dirvec)
-                   for thisslice in oldslices[z]]
+    #make a dict so we can grab direction by z
+    dirdict = Dict(z => d for (z,d) in zip(sortedz,dirvec))
+    #build a vector of z => hatchedslice pairs
+    pairvec = map(oldslices) do (z,s)
+        z => hatch(s;dhatch,hatchdir=dirdict[z])
+    end
     Block(pairvec..., origin=origin(b), rotation=rotation(b))
 end
 
@@ -817,13 +829,17 @@ function pftranslate(sb::SuperBlock,displacement::Vector{<:Unitful.Length})
     xylocaldisp = zrotate(displacement[1:2],-rotation(sb))
     localdisp = vcat(xylocaldisp,displacement[3])
     translatedblocks = map(blocks(sb)) do b
-        pftranslate(b,localdisp)
+        translate(b,localdisp,preserveframe=true)
     end
     SuperBlock(translatedblocks...,origin=origin(sb),rotation=rotation(sb))
 end
 
 function pfrotate(sb::SuperBlock,amount::Number,point::Vector{<:Unitful.Length})
-    #fill me out
+    #just have to apply the rotation to every block
+    newblocks = map(blocks(sb)) do b
+        rotate(b,amount,point,preserveframe=true)
+    end
+    SuperBlock(newblocks...,origin=origin(sb),rotation=rotation(sb))
 end
 
 function hatch(sb::SuperBlock, dhatch::Unitful.Length, bottomdir::Number, diroffset::Number)
