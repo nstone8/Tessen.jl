@@ -168,13 +168,28 @@ function intersections(le::LineEdge,hl::HatchLine)
     v2 = hl.v #direction of second line
 
     #first check to see if le is colinear to hl, if so we should just return our endpoints
-    if isapprox((v1./v2)...;atol)
+    #checking the slope by division doesn't work well if the line is vertical due to numerical
+    #precision issues, we will call things parallel if either the slope or inverse slope is the
+    #same
+    if (isapprox(/(v1...),/(v2...);atol) || isapprox(/(reverse(v1)...),/(reverse(v2)...);atol))
         #the lines are parallel, these are colinear if either p1==p2
         samepoints = all(isapprox.(p1,p2;atol))
         #or if (p1-p2) is parallel to v2
-        parallel = isapprox(((p1-p2)./v2)...;atol)
+        #same numerical precision thing here
+        pvec=p1-p2
+        parallel = (isapprox(/(pvec...),/(v2...);atol) ||
+            isapprox(/(reverse(pvec)...),/(reverse(v2)...);atol))
         if samepoints || parallel
-            return [le.p1,le.p2]
+            #need to convert these endpoints into a parametric coordinate
+            return map([le.p1,le.p2]) do ep
+                #get a vector going from hl.p to ep
+                d = ep - hl.p
+                #we know everything is colinear already, so we only need to look at one coordinate
+                #to get our parametric distance. We'll use the one that is largest to minimize
+                #numerical issues
+                (m,im) = findmax(d)
+                m/hl.v[im]
+            end
         end
     end
     
@@ -685,6 +700,8 @@ struct Block{T} <: LocalFrame{T}
     slices::Dict{<:Number,Vector{T}}
     function Block(origin::Vector{<:Unitful.Length},rotation::Number,
                    slicepairs::Pair...)
+        #origin needs to be 3D
+        @assert length(origin) == 3 "LocalFrame coordinate origins must have 3 coordinates"
         #strip units, we will represent everything internally in microns
         rawslice = [ustrip(u"µm",sp.first) => sp.second for sp in slicepairs]
         #change our slice pairs into a dict
@@ -700,7 +717,7 @@ struct Block{T} <: LocalFrame{T}
         new{slicetype}(ustrip.(u"µm",origin),rotation,slices)
     end
     #LocalFrame innner constructor to make translation/rotation easier
-    function Block{T}(b::Block{T},translation,rotation) where {T}
+    function Block{T}(b::Block{T},translation::Vector{<:Unitful.Length},rotation) where {T}
         #if translation isn't in 3D, go ahead and assume we mean movement in xy
         if length(translation) == 2
             push!(translation,0u"µm")
@@ -795,11 +812,12 @@ struct SuperBlock{T} <: LocalFrame{T}
 
     function SuperBlock(origin::Vector{<:Unitful.Length},rotation::Number,
                         blocks::LocalFrame{T}...) where {T}
+        @assert length(origin) == 3 "LocalFrame coordinate origins must have 3 coordinates"
         new{T}(ustrip.(u"µm",origin),rotation,collect(blocks))
     end
 
     #localframe constructor
-    function SuperBlock{T}(sb::SuperBlock{T},translation,rotation) where {T}
+    function SuperBlock{T}(sb::SuperBlock{T},translation::Vector{<:Unitful.Length},rotation) where {T}
         #if translation isn't in 3D, go ahead and assume we mean movement in xy
         if length(translation) == 2
             push!(translation,0)
@@ -808,7 +826,7 @@ struct SuperBlock{T} <: LocalFrame{T}
                sb.rotation + rotation, sb.blocks)
     end
 end
-SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm"],rotation=0) = SuperBlock(origin,rotation,blocks...)
+SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) = SuperBlock(origin,rotation,blocks...)
 origin(sb::SuperBlock) = sb.origin * 1u"µm"
 rotation(sb::SuperBlock) = sb.rotation
 
