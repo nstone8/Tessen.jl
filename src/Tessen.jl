@@ -3,7 +3,7 @@ module Tessen
 using LinearAlgebra, Unitful, RecipesBase, Statistics
 
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
-export Block, SuperBlock, blocks, slices, hatch
+export Block, SuperBlock, blocks, slices, hatch, HatchedSlice
 
 #absolute tolerance for isapprox
 atol = 1E-12
@@ -720,7 +720,8 @@ struct Block{T} <: LocalFrame{T}
     function Block{T}(b::Block{T},translation::Vector{<:Unitful.Length},rotation) where {T}
         #if translation isn't in 3D, go ahead and assume we mean movement in xy
         if length(translation) == 2
-            push!(translation,0u"µm")
+            #create a new vector so we don't modify `translation` in the calling scope
+            translation=vcat(translation,0u"µm")
         end
         new{T}(ustrip.(u"µm",(b.origin * 1u"µm") + translation),
                b.rotation + rotation, b.slices)
@@ -745,7 +746,7 @@ slices(b::Block) = [(z*u"µm") => slice for (z,slicevec) in b.slices for slice i
 function pftranslate(b::Block,displacement::Vector{<:Unitful.Length})
     #if displacement has length 2, assume translation in xy
     if length(displacement) == 2
-        push!(displacement,0u"µm")
+        displacement = vcat(displacement,0u"µm")
     end
     @assert length(displacement) == 3
     #translate every slice individually in xy
@@ -753,6 +754,27 @@ function pftranslate(b::Block,displacement::Vector{<:Unitful.Length})
     localdisp = zrotate(displacement[1:2],-rotation(b))
     flatslices = [(z + displacement[3]) => translate(ts,localdisp) for (z,ts) in slices(b)]
     Block(flatslices...,origin=origin(b),rotation=rotation(b))
+end
+
+"""
+```julia
+merge(blocks...)
+```
+Create a `Block` which contains all of the slices present in `blocks`. The source `Blocks` must
+all share a common local coordinate system (i.e. `origin(b)` and `rotation(b)` must be the same
+for all arguments
+"""
+function Base.merge(b1::Block,blks::Block...)
+    #if we're only given one block just bounce it back
+    if length(blks) == 0
+        return b1
+    end
+    @assert all(origin(bi) == origin(b1) for bi in blks) &&
+        all(rotation(bi) == rotation(b1) for bi in blks) "all arguments must share a coordinate system"
+    #build a vector of vectors of all the slices
+    allslices = [slices(b) for b in vcat(b1,blks...)]
+    #build a Block containing all of them
+    Block(vcat(allslices...)...,origin=origin(b1),rotation=rotation(b1))        
 end
 
 function pfrotate(b::Block,amount::Number,point::Vector{<:Unitful.Length})
@@ -808,10 +830,10 @@ struct SuperBlock{T} <: LocalFrame{T}
     origin::Vector{<:Number}
     #local frame rotation in radians
     rotation::Number
-    blocks::Vector{LocalFrame{T}}
+    blocks::Vector{LocalFrame{<:T}}
 
-    function SuperBlock(origin::Vector{<:Unitful.Length},rotation::Number,
-                        blocks::LocalFrame{T}...) where {T}
+    function SuperBlock{T}(origin::Vector{<:Unitful.Length},rotation::Number,
+                        blocks::LocalFrame{<:T}...) where {T}
         @assert length(origin) == 3 "LocalFrame coordinate origins must have 3 coordinates"
         new{T}(ustrip.(u"µm",origin),rotation,collect(blocks))
     end
@@ -820,13 +842,24 @@ struct SuperBlock{T} <: LocalFrame{T}
     function SuperBlock{T}(sb::SuperBlock{T},translation::Vector{<:Unitful.Length},rotation) where {T}
         #if translation isn't in 3D, go ahead and assume we mean movement in xy
         if length(translation) == 2
-            push!(translation,0)
+            translation = vcat(translation,0u"µm")
         end
         new{T}(ustrip.(u"µm",(sb.origin * 1u"µm") + translation),
                sb.rotation + rotation, sb.blocks)
     end
 end
-SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) = SuperBlock(origin,rotation,blocks...)
+
+#if all the same T
+function SuperBlock(blocks::LocalFrame{T}...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) where {T}
+    SuperBlock{T}(origin,rotation,blocks...)
+end
+
+#otherwise
+function SuperBlock(blocks::LocalFrame{<:AbstractSlice}...;
+                    origin=[0u"µm",0u"µm",0u"µm"],rotation=0)
+    SuperBlock{AbstractSlice}(origin,rotation,blocks...)
+end
+
 origin(sb::SuperBlock) = sb.origin * 1u"µm"
 rotation(sb::SuperBlock) = sb.rotation
 
@@ -841,7 +874,7 @@ blocks(sb::SuperBlock) = sb.blocks
 function pftranslate(sb::SuperBlock,displacement::Vector{<:Unitful.Length})
     #if displacement has length 2, assume translation in xy
     if length(displacement) == 2
-        push!(displacement,0u"µm")
+        displacement = vcat(displacement,0u"µm")
     end
     #need to convert xy displacement into local coordinate system
     xylocaldisp = zrotate(displacement[1:2],-rotation(sb))
