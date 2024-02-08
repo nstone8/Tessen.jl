@@ -4,6 +4,7 @@ using LinearAlgebra, Unitful, RecipesBase, Statistics
 
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
 export Block, SuperBlock, blocks, slices, hatch, HatchedSlice
+export origin, rotation
 
 #absolute tolerance for isapprox
 atol = 1E-12
@@ -448,9 +449,11 @@ end
 HatchedSlice(hatchlines)
 ```
 `struct` representing a hatched `Slice`. The `hatchlines` field of this struct
-is a vector of point pairs describing line segments presented in order to
-neatly hatch the `Slice` in a zigzag pattern. This constructor is not intended to be
-used directly. Use the `hatch` function instead.
+is a vector of point vectors describing line segments presented in order to
+neatly hatch the `Slice` in a zigzag pattern. In between top level `Vectors` (i.e. between
+`hatchlines[1]` and `hatchlines[2]` the tool path must be broken to ensure that the shape is
+represented faithfully. This constructor is not intended to be used directly. Use the `hatch`
+function instead.
 """
 struct HatchedSlice <: AbstractSlice
     hatchlines :: Vector{Vector{Vector{<:Number}}}
@@ -541,6 +544,7 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
         end
         #if inters has only one entry we are perfectly clipping the corner of a polygon
         #these cases (like tangent points on arcs) don't matter for hatching
+        @assert length(inters) != 1 "guess i was wrong"
         if length(inters) == 1
             return nothing
         end
@@ -550,10 +554,11 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
         #now need to turn this into points rather than parametric coords
         [pointalong(hl,i) for i in inters]
     end
-    #remove nothing entries
+    #remove nothing entries (using the non-mutating filter so the type can change)
     filter!(intervec) do iv
         !isnothing(iv)
     end
+    #====================Old version======================================
     #split the intersections into pairs via reshape        
     intermat = reshape(vcat(intervec...),2,:)
     #change the matrix into a vector of vectors of vectors
@@ -564,6 +569,33 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
     filter!(hatchlines) do (p1,p2)
         !all(isapprox.(p1,p2;atol))
     end
+    ====================================================================#
+    #intervec now contains a vector of vectors of vectors. The innermost vectors are coordinates
+    #in 2D, grouped into vectors of points which occur on the same hatch line. We only need to
+    #pick up our pen (so to speak) to avoid filling in a desired hole if a second-level vector
+    #has length > 2 (as this would imply intersection with a hatch line more than twice. Our goal
+    #here will be to make a new vector of vectors of vectors where the second level vector is a
+    #list of points that can be written continuously without lifting our pen
+    numtype = eltype(intervec[1][1][1])
+    hatchlines = Vector{Vector{Vector{numtype}}}()
+    #the current path we are building
+    curpath = Vector{Vector{numtype}}()
+    for iv in intervec
+        if length(iv) == 2
+            #throw them on
+            push!(curpath,iv...)
+        else
+            #put the first two points on
+            push!(curpath,iv[1:2]...)
+            for j in 2:(length(iv)/2)
+                #each extra pair of points should be made into its own path, except for the last
+                #two, which can be part of a new one
+                push!(hatchlines,curpath)
+                curpath = collect(iv[(2j-1):2j])
+            end
+        end
+    end
+    push!(hatchlines,curpath)
     HatchedSlice(hatchlines)
 end
 
@@ -595,6 +627,16 @@ we will assume there are methods for origin and rotation
 as well as an inner constructor T(t::T,translation,rotation)
 """
 abstract type LocalFrame{T} end
+
+"""
+```julia
+slicetype(lf)
+```
+Get the slice type of a `LocalFrame`. (get `T` for `lf::LocalFrame{T}`)
+"""
+function slicetype(::LocalFrame{T}) where {T}
+    T
+end
 
 """
 ```julia
@@ -833,7 +875,7 @@ struct SuperBlock{T} <: LocalFrame{T}
     blocks::Vector{LocalFrame{<:T}}
 
     function SuperBlock{T}(origin::Vector{<:Unitful.Length},rotation::Number,
-                        blocks::LocalFrame{<:T}...) where {T}
+                        blocks::Vector{<:LocalFrame{<:T}}) where {T}
         @assert length(origin) == 3 "LocalFrame coordinate origins must have 3 coordinates"
         new{T}(ustrip.(u"µm",origin),rotation,collect(blocks))
     end
@@ -849,17 +891,11 @@ struct SuperBlock{T} <: LocalFrame{T}
     end
 end
 
-#if all the same T
-function SuperBlock(blocks::LocalFrame{T}...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0) where {T}
-    SuperBlock{T}(origin,rotation,blocks...)
+function SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0)
+    blockvec=collect(blocks)
+    T=promote_type(slicetype.(blockvec)...)
+    SuperBlock{T}(origin,rotation,blockvec)
 end
-
-#otherwise
-function SuperBlock(blocks::LocalFrame{<:AbstractSlice}...;
-                    origin=[0u"µm",0u"µm",0u"µm"],rotation=0)
-    SuperBlock{AbstractSlice}(origin,rotation,blocks...)
-end
-
 origin(sb::SuperBlock) = sb.origin * 1u"µm"
 rotation(sb::SuperBlock) = sb.rotation
 
