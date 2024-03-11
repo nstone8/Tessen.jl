@@ -587,7 +587,7 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
         else
             #put the first two points on
             push!(curpath,iv[1:2]...)
-            for j in 2:(length(iv)/2)
+            for j in 2:Int(length(iv)/2)
                 #each extra pair of points should be made into its own path, except for the last
                 #two, which can be part of a new one
                 push!(hatchlines,curpath)
@@ -637,6 +637,15 @@ Get the slice type of a `LocalFrame`. (get `T` for `lf::LocalFrame{T}`)
 function slicetype(::LocalFrame{T}) where {T}
     T
 end
+
+
+"""
+```julia
+changeslicetype(T,lf)
+```
+Change the slice type of a `LocalFrame` to `T`
+"""
+function changeslicetype end
 
 """
 ```julia
@@ -768,6 +777,20 @@ struct Block{T} <: LocalFrame{T}
         new{T}(ustrip.(u"µm",(b.origin * 1u"µm") + translation),
                b.rotation + rotation, b.slices)
     end
+    #inner constructor to allow for conversions of Blocks{T} to Block{AbstractSlice}
+    function Block{AbstractSlice}(b::Block)
+        numtype=promote_type(typeof.(keys(b.slices))...)
+        new{AbstractSlice}(b.origin,b.rotation,
+                           convert(Dict{numtype,Vector{AbstractSlice}},b.slices))
+    end
+end
+
+function Base.convert(::Type{Block{AbstractSlice}},b::Block)
+    Block{AbstractSlice}(b)
+end
+
+function changeslicetype(T::Type{<:AbstractSlice},b::Block)
+    convert(Block{T},b)
 end
 
 #make kwargs optional
@@ -882,19 +905,33 @@ struct SuperBlock{T} <: LocalFrame{T}
 
     #localframe constructor
     function SuperBlock{T}(sb::SuperBlock{T},translation::Vector{<:Unitful.Length},rotation) where {T}
+        
         #if translation isn't in 3D, go ahead and assume we mean movement in xy
         if length(translation) == 2
             translation = vcat(translation,0u"µm")
         end
+        
         new{T}(ustrip.(u"µm",(sb.origin * 1u"µm") + translation),
                sb.rotation + rotation, sb.blocks)
     end
 end
 
+function changeslicetype(T::Type{<:AbstractSlice},sb::SuperBlock)
+    b = sb.blocks
+    convb = map(b) do bi
+        changeslicetype(T,bi)
+    end
+    #need to add the units back on
+    SuperBlock{T}(sb.origin*u"µm",sb.rotation,convb)
+end
+
 function SuperBlock(blocks::LocalFrame...;origin=[0u"µm",0u"µm",0u"µm"],rotation=0)
     blockvec=collect(blocks)
     T=promote_type(slicetype.(blockvec)...)
-    SuperBlock{T}(origin,rotation,blockvec)
+    convvec = map(blockvec) do bv
+        changeslicetype(T,bv)
+    end
+    SuperBlock{T}(origin,rotation,convvec)
 end
 origin(sb::SuperBlock) = sb.origin * 1u"µm"
 rotation(sb::SuperBlock) = sb.rotation
