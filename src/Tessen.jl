@@ -4,10 +4,10 @@ using LinearAlgebra, Unitful, RecipesBase, Statistics
 
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
 export Block, SuperBlock, blocks, slices, hatch, HatchedSlice
-export origin, rotation
+export origin, rotation, translateorigin
 
 #absolute tolerance for isapprox
-atol = 1E-12
+atol = 1E-9
 
 """
 ```julia
@@ -681,6 +681,20 @@ end
 
 #make point optional
 rotate(lf::LocalFrame,amount;preserveframe=false) = rotate(lf,amount,[0u"µm",0u"µm"];preserveframe)
+
+"""
+```julia
+
+```
+Translate the origin of a `Block` or `SuperBlock`. The position of the geometry will remain
+unchanged in the enclosing frame.
+"""
+function translateorigin(lf::LocalFrame,displacement)
+    #first translate with preserveframe=false to move the origin
+    t = translate(lf,displacement,preserveframe=false)
+    #now move the geometry back
+    translate(t,-displacement,preserveframe=true)
+end
 
 """
 ```julia
