@@ -690,10 +690,10 @@ Translate the origin of a `Block` or `SuperBlock`. The position of the geometry 
 unchanged in the enclosing frame.
 """
 function translateorigin(lf::LocalFrame,displacement)
-    #first translate with preserveframe=false to move the origin
-    t = translate(lf,displacement,preserveframe=false)
-    #now move the geometry back
-    translate(t,-displacement,preserveframe=true)
+    #first move the geometry back relative to the origin
+    t = translate(lf,-displacement,preserveframe=true)
+    #now translate with preserveframe=false to move the origin
+    translate(t,displacement,preserveframe=false)
 end
 
 """
