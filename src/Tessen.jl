@@ -5,6 +5,7 @@ using LinearAlgebra, Unitful, RecipesBase, Statistics
 export LineEdge, ArcEdge, Contour, Slice, translate, rotate
 export Block, SuperBlock, blocks, slices, hatch, HatchedSlice
 export origin, rotation, translateorigin
+export span, pointalong, subsection, offset
 
 #absolute tolerance for isapprox
 atol = 1E-9
@@ -25,7 +26,7 @@ struct HatchLine
         @assert length(p) == 2 "point used to define a HatchLine must have 2 coordinates"
         @assert length(v) == 2 "vector used to define a HatchLine must have 2 coordinates"
         #convert to microns and strip the units
-        new(ustrip.(u"μm",p),ustrip.(u"μm",v))
+        new(ustrip.(u"µm",p),ustrip.(u"µm",v))
     end
 end
 
@@ -93,7 +94,7 @@ rotate around the origin.
 function rotate end
 
 #define the two argument version here
-rotate(obj,amount) = rotate(obj,amount,[0,0] * u"μm")
+rotate(obj,amount) = rotate(obj,amount,[0,0] * u"µm")
 
 """
 ```julia
@@ -103,6 +104,41 @@ Translate a `Tessen` object in the xy plane. `displacement` should be a `Vector`
 of `Unitful.Length`.
 """
 function translate end
+
+"""
+```julia
+span(edge)
+```
+Return a `number` representing the length of an `Edge` in microns
+"""
+function span end
+
+"""
+```julia
+pointalong(edge,x)
+```
+Get a point, represented by a `Vector{<:Number}` which is a linear distance `x` away
+from the start point (`endpoint(edge)[1]`) of an `Edge` along the edge.
+"""
+pointalong(e,x::Quantity) = pointalong(e,ustrip(u"µm",x))
+
+
+"""
+```julia
+subsection(edge,x1,x2)
+```
+Get the section of `edge` which has endpoints `x1` and `x2` away from the startpoint of
+`edge`
+"""
+subsection(e,x1::Quantity,x2::Quantity) = subsection(e,ustrip(u"µm",x1),ustrip(u"µm",x2))
+
+"""
+```julia
+offset(edge,x)
+```
+Create a projection of an `Edge` separated from the source `edge` by `x`.
+"""
+offset(e,x::Quantity) = offset(e,ustrip(u"µm",x))
 
 """
 ```julia
@@ -120,7 +156,7 @@ struct LineEdge <: Edge
             length(p) == 2
         end
         #convert to microns, strip units
-        new(ustrip.(u"μm",p1),ustrip.(u"μm",p2))
+        new(ustrip.(u"µm",p1),ustrip.(u"µm",p2))
     end
 end
 
@@ -132,20 +168,20 @@ end
 
 function rotate(le::LineEdge,amount,pointunits::Vector{<:Unitful.Length})
     #get the point coordinates in um
-    point = ustrip.(u"μm",pointunits)
+    point = ustrip.(u"µm",pointunits)
     originalendpoints = [le.p1,le.p2]
     #first translate everything so point lies at the origin
     transpoints = [ep - point for ep in originalendpoints]
     #do the rotation
     rotpoints = zrotate.(transpoints,amount)
     #translate back, add back on units
-    finalpoints = [rp + point for rp in rotpoints] .* u"μm"
+    finalpoints = [rp + point for rp in rotpoints] .* u"µm"
     LineEdge(finalpoints...)
 end
 
 function translate(le::LineEdge,displacement::Vector{<:Unitful.Length})
     #need to add units to the current points (all stored in microns)
-    oldpoints = [le.p1, le.p2] .* u"μm"
+    oldpoints = [le.p1, le.p2] .* u"µm"
     LineEdge((op + displacement for op in oldpoints)...)
 end
 
@@ -208,6 +244,49 @@ end
 
 boundpoints(le::LineEdge) = [le.p1,le.p2]
 
+function span(e::LineEdge)
+    #get a vector going from the start to the end of e
+    v = e.p2 - e.p1
+    norm(v)
+end
+
+"""
+```julia
+unit(le)
+```
+Get a unit vector pointing along a `LineEdge`
+"""
+function unit(le::LineEdge)
+    v = (le.p2 - le.p1)
+    v/norm(v)
+end
+
+function pointalong(e::LineEdge,x::Real)
+    @assert x <= span(e) "the second argument to `pointalong(e,x)` must be less than `span(e)`"
+    x*unit(e) + e.p1
+end
+
+function subsection(e::LineEdge,x1::Real,x2::Real)
+    LineEdge(1u"µm"*pointalong.(e,[x1,x2])...)
+end
+
+"""
+When applied to `LineEdge`s, offset(edge,x) projects the `LineEdge` to the right
+when viewed along the edge
+"""
+function offset(e::LineEdge,x::Real)
+    #get a unit vector along e
+    u = unit(e)
+    #now get a vector perpendicular to this one
+    u_p = reverse(u) .* [1,-1]
+
+    #now translate the start and endpoints of e along p
+    newends = map([e.p1,e.p2]) do p
+        1u"µm"*(p + x*u_p)
+    end
+    LineEdge(newends...)
+end
+
 """
 ```julia
 ArcEdge(c,r,startangle,stopangle)
@@ -238,7 +317,7 @@ struct ArcEdge <: Edge
             (a >= 0) ? a : a + 2pi
         end
         #convert to microns and strip units
-        new(ustrip.(u"μm",c),ustrip(u"μm",r),angles...)
+        new(ustrip.(u"µm",c),ustrip(u"µm",r),angles...)
     end
 end
 
@@ -248,21 +327,21 @@ boundbox(ae::ArcEdge) = map([-1,1]) do corner
 end
 
 function rotate(ae::ArcEdge,amount,pointunits::Vector{<:Unitful.Length})
-    point = ustrip.(u"μm",pointunits) #convert to microns and strip units
+    point = ustrip.(u"µm",pointunits) #convert to microns and strip units
     #translate c such that `point` lies at the origin
     transc = ae.c - point
     #rotate around point
     rotc = zrotate(transc,amount)
     #translate back, add units back on
-    newc = (rotc + point) * u"μm"
+    newc = (rotc + point) * u"µm"
     #add rotation to startangle and stopangle
     newangles = [ae.startangle,ae.stopangle] .+ amount
-    ArcEdge(newc,ae.r*u"μm",newangles...)
+    ArcEdge(newc,ae.r*u"µm",newangles...)
 end
 
 function translate(ae::ArcEdge,displacement::Vector{<:Unitful.Length})
     #all we have to do is translate our center point
-    oldc = ae.c * u"μm" #need to add back on units
+    oldc = ae.c * u"µm" #need to add back on units
     newc = oldc + displacement
     ArcEdge(newc,ae.r*1u"µm",ae.startangle,ae.stopangle)
 end
@@ -338,6 +417,40 @@ function intersections(ae::ArcEdge,hl::HatchLine)
         #the parametric coordinate is the distance along hl.v (crot[1] + rrci[1]) divided by the magnitude of hl.v
         (crot[1] + rrci[1]) ./ sqrt(sum(hl.v .^ 2))
     end
+end
+
+function span(e::ArcEdge)
+    #total angle covered
+    a = e.stopangle - e.startangle
+    #a should be greater than zero, if not add 2pi
+    a = a >= 0 ? a : a + 2pi
+    e.r * a
+end
+
+function pointalong(e::ArcEdge,x::Real)
+    #get the amount of arc required to cover x distance around a circle with radius r
+    a = x*1u/e.r
+    ourangle = e.startangle + a
+    #get a vector going from the center of our radius of curvature to our point
+    v = e.r*[cos(ourangle),sin(ourangle)]
+    e.c + v
+end
+
+function subsection(e::ArcEdge,x1::Real,x2::Real)
+    #get the amount of arc required to cover x1 and x2 distances
+    a = [x1,x2]/e.r
+    angles = e.startangle .+ a
+    ArcEdge(e.c*u"µm",e.r*u"µm",angles...)
+end
+
+"""
+When applied to `ArcEdge`s, `offset(edge,x)` operates by increasing the radius of curvature by x
+"""
+function offset(e::ArcEdge,x::Real)
+    #we can accomplish this just by changing the radius
+    r = e.r + x
+    @assert r>=0 "offset cannot result in a radius which isn't positive"
+    ArcEdge(e.c*u"µm",r*u"µm",e.startangle,e.stopangle)
 end
 
 function boundpoints(ae::ArcEdge,numpoints=100)
