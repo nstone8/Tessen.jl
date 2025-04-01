@@ -109,7 +109,7 @@ function translate end
 ```julia
 span(edge)
 ```
-Return a `number` representing the length of an `Edge` in microns
+Return a `Number` representing the length of an `Edge` in microns
 """
 function span end
 
@@ -118,7 +118,7 @@ function span end
 pointalong(edge,x)
 ```
 Get a point, represented by a `Vector{<:Number}` which is a linear distance `x` away
-from the start point (`endpoint(edge)[1]`) of an `Edge` along the edge.
+from the start point of an `Edge` along the edge.
 """
 pointalong(e,x::Quantity) = pointalong(e,ustrip(u"µm",x))
 
@@ -429,7 +429,7 @@ end
 
 function pointalong(e::ArcEdge,x::Real)
     #get the amount of arc required to cover x distance around a circle with radius r
-    a = x*1u/e.r
+    a = x/e.r
     ourangle = e.startangle + a
     #get a vector going from the center of our radius of curvature to our point
     v = e.r*[cos(ourangle),sin(ourangle)]
