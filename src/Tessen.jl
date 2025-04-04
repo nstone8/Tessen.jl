@@ -155,6 +155,8 @@ struct LineEdge <: Edge
         @assert all([p1,p2]) do p
             length(p) == 2
         end
+        @assert all(isfinite.(vcat(p1,p2))) "all coordinates should be finite"
+        @assert p1 != p2 "LineEdge must have finite length"
         #convert to microns, strip units
         new(ustrip.(u"µm",p1),ustrip.(u"µm",p2))
     end
@@ -267,7 +269,7 @@ function pointalong(e::LineEdge,x::Real)
 end
 
 function subsection(e::LineEdge,x1::Real,x2::Real)
-    LineEdge(1u"µm"*pointalong.(e,[x1,x2])...)
+    LineEdge(1u"µm"*[pointalong(e,x) for x in [x1,x2]]...)
 end
 
 """
@@ -306,8 +308,10 @@ struct ArcEdge <: Edge
     startangle :: Number
     stopangle :: Number
     function ArcEdge(c::Vector{<:Unitful.Length},r::Unitful.Length,startangle::Number,stopangle::Number)
+        @assert all(isfinite.(vcat(c,r,startangle,stopangle))) "all parameters must be finite"
         @assert length(c) == 2 "all coordinates must have 2 entries"
         @assert startangle != stopangle
+        @assert r > 0u"μm" "radius must be positive"
         #make sure all angles are between 0 and 2pi
         angles = map([startangle,stopangle]) do a
             if abs(a) > 2pi
@@ -657,11 +661,13 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
         end
         #if inters has only one entry we are perfectly clipping the corner of a polygon
         #these cases (like tangent points on arcs) don't matter for hatching
-        @assert length(inters) != 1 "guess i was wrong"
         if length(inters) == 1
             return nothing
         end
-        @assert iseven(length(inters))
+        if isodd(length(inters))
+            @warn  "$hl itersects $s an odd number of times"
+            return nothing
+        end
         #we will sort these into an order based on `rev`
         sort!(inters;rev)
         #now need to turn this into points rather than parametric coords
@@ -797,7 +803,7 @@ rotate(lf::LocalFrame,amount;preserveframe=false) = rotate(lf,amount,[0u"µm",0u
 
 """
 ```julia
-
+translateorigin(localframe,displacement)
 ```
 Translate the origin of a `Block` or `SuperBlock`. The position of the geometry will remain
 unchanged in the enclosing frame.
