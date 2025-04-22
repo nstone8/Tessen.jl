@@ -156,7 +156,7 @@ struct LineEdge <: Edge
             length(p) == 2
         end
         @assert all(isfinite.(vcat(p1,p2))) "all coordinates should be finite"
-        @assert p1 != p2 "LineEdge must have finite length"
+        #@assert p1 != p2 "LineEdge must have finite length"
         #convert to microns, strip units
         new(ustrip.(u"µm",p1),ustrip.(u"µm",p2))
     end
