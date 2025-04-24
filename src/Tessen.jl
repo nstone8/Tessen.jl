@@ -224,10 +224,10 @@ function intersections(le::LineEdge,hl::HatchLine)
                 #get a vector going from hl.p to ep
                 d = ep - hl.p
                 #we know everything is colinear already, so we only need to look at one coordinate
-                #to get our parametric distance. We'll use the one that is largest to minimize
-                #numerical issues
-                (m,im) = findmax(d)
-                m/hl.v[im]
+                #to get our parametric distance. We'll use the one corresponding to the largest
+                #component of hl.v to minimize numerical issues
+                (m,im) = findmax(hl.v)
+                d[im]/m
             end
         end
     end
@@ -665,7 +665,7 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
             return nothing
         end
         if isodd(length(inters))
-            @warn  "$hl itersects $s an odd number of times"
+            @warn "hatchline intersecting a slice an odd number of times, ignoring this hatchline"
             return nothing
         end
         #we will sort these into an order based on `rev`
