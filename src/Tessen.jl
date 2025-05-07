@@ -603,7 +603,20 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
     4) place hatchlines in each direction until we place a hatchline that doesn't intersect our box
     5) done
     ======================================================================#
-    bboxcorners = boundbox(s) .* 1u"µm" #need units for the LineEdge constructor
+    bboxunitless = boundbox(s)
+    bboxcorners = bboxunitless .* 1u"µm" #need units for the LineEdge constructor
+    #make a helper function so we can test if a point along a hatchline is inside our bounding box
+    function inbounds(t,hl::HatchLine)
+        point = pointalong(hl,t)
+        all(1:2) do dim
+            thesecoords = map(bboxunitless) do p
+                p[dim]
+            end
+            mincoord = minimum(thesecoords)
+            maxcoord = maximum(thesecoords)
+            (mincoord <= point[dim] <= maxcoord) || (isapprox(mincoord,point[dim])) || (isapprox(maxcoord,point[dim]))
+        end
+    end
     bboxedges = [LineEdge(bboxcorners[1],
                           [bboxcorners[2][1],bboxcorners[1][2]]),
                  LineEdge([bboxcorners[2][1],bboxcorners[1][2]],
@@ -655,8 +668,16 @@ function hatch(s::Slice,dhatchunits::Unitful.Length,hatchdir::Number)::HatchedSl
     intervec = map(zip(hlines,alternator)) do (hl,rev)
         #get the even number of points where `hl` intersects `s`
         inters = intersections(s,hl)
-        #if there are no intersections, just add nothing
         if isnothing(inters)
+            return nothing
+        end
+        
+        filter!(inters) do thisinter
+            inbounds(thisinter,hl)
+        end
+        
+        #if there are no intersections, just add nothing
+        if isempty(inters)
             return nothing
         end
         #if inters has only one entry we are perfectly clipping the corner of a polygon
